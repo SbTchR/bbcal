@@ -1,6 +1,16 @@
 "use strict";
 
 const STORAGE_KEY = "bbcal-state-v1";
+const FIREBASE_DOC_PATH = ["bbcal", "shared-state"];
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyD1fgN-1eYacn-Earewjn95MlgZ_kzsvQM",
+  authDomain: "bbcal-e3d73.firebaseapp.com",
+  projectId: "bbcal-e3d73",
+  storageBucket: "bbcal-e3d73.firebasestorage.app",
+  messagingSenderId: "49321382886",
+  appId: "1:49321382886:web:b70fb41fa125b2946dfc27",
+  measurementId: "G-DEDYNMH34G"
+};
 
 const DAYS = [
   { id: "mon", fr: "Lundi", de: "Montag" },
@@ -21,6 +31,10 @@ const I18N = {
     compareTitle: "Comparer les disponibilités",
     compareLead: "Choisissez une classe, puis une ou plusieurs classes partenaires. Les chevauchements sont calculés avec les heures des périodes.",
     autosaved: "Enregistré automatiquement",
+    firebaseConnecting: "Connexion aux données partagées...",
+    firebaseOnline: "Données partagées synchronisées",
+    firebaseOffline: "Mode local, Firebase indisponible",
+    firebaseSaving: "Sauvegarde en ligne...",
     selection: "Sélection",
     baseClass: "Classe de départ",
     partnerClasses: "Classes partenaires",
@@ -99,6 +113,10 @@ const I18N = {
     compareTitle: "Verfügbarkeiten vergleichen",
     compareLead: "Wählen Sie eine Klasse und eine oder mehrere Partnerklassen. Die Überschneidungen werden anhand der tatsächlichen Lektionenzeiten berechnet.",
     autosaved: "Automatisch gespeichert",
+    firebaseConnecting: "Verbindung zu den gemeinsamen Daten...",
+    firebaseOnline: "Gemeinsame Daten synchronisiert",
+    firebaseOffline: "Lokaler Modus, Firebase nicht verfügbar",
+    firebaseSaving: "Online speichern...",
     selection: "Auswahl",
     baseClass: "Ausgangsklasse",
     partnerClasses: "Partnerklassen",
@@ -239,6 +257,7 @@ let state = loadState();
 let ui = {
   view: "compare",
   lang: localStorage.getItem("bbcal-lang") === "de" ? "de" : "fr",
+  syncStatus: "connecting",
   compareBase: classKey("bercher", "9VG1"),
   comparePartners: [],
   availabilitySchool: "bercher",
@@ -248,12 +267,18 @@ let ui = {
   partnershipBase: classKey("bercher", "9VG1")
 };
 let toastTimer = null;
+let firebaseDb = null;
+let firebaseDocRef = null;
+let remoteSaveTimer = null;
+let applyingRemoteState = false;
+let lastRemoteJson = "";
 
 document.addEventListener("click", handleClick);
 document.addEventListener("change", handleChange);
 document.addEventListener("input", handleInput);
 
 render();
+initFirebaseSync();
 
 function createDefaultState() {
   const schools = {};
@@ -371,6 +396,98 @@ function normalizeTime(value) {
 
 function saveState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  scheduleRemoteSave();
+}
+
+async function initFirebaseSync() {
+  try {
+    const [{ initializeApp }, { initializeFirestore, doc, getDoc, onSnapshot, setDoc, serverTimestamp }] = await Promise.all([
+      import("https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js"),
+      import("https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js")
+    ]);
+
+    const firebaseApp = initializeApp(FIREBASE_CONFIG);
+    firebaseDb = initializeFirestore(firebaseApp, {
+      experimentalAutoDetectLongPolling: true
+    });
+    firebaseDocRef = doc(firebaseDb, ...FIREBASE_DOC_PATH);
+    window.bbcalFirebaseSetDoc = setDoc;
+    window.bbcalFirebaseServerTimestamp = serverTimestamp;
+
+    const firstSnapshot = await withTimeout(getDoc(firebaseDocRef), 8000);
+    if (firstSnapshot.exists() && firstSnapshot.data()?.state) {
+      applyRemoteState(firstSnapshot.data().state);
+    } else {
+      await writeRemoteState();
+    }
+
+    onSnapshot(firebaseDocRef, (snapshot) => {
+      const remoteState = snapshot.data()?.state;
+      if (!remoteState) return;
+      applyRemoteState(remoteState);
+      ui.syncStatus = "online";
+      render();
+    }, (error) => {
+      console.warn("Synchronisation Firestore interrompue.", error);
+      ui.syncStatus = "offline";
+      render();
+    });
+
+    ui.syncStatus = "online";
+    render();
+  } catch (error) {
+    console.warn("Firebase indisponible, l'app continue en mode local.", error);
+    ui.syncStatus = "offline";
+    render();
+  }
+}
+
+function withTimeout(promise, timeoutMs) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      window.setTimeout(() => reject(new Error("Firebase timeout")), timeoutMs);
+    })
+  ]);
+}
+
+function applyRemoteState(remoteState) {
+  const normalized = normalizeState(remoteState);
+  const remoteJson = JSON.stringify(normalized);
+  if (remoteJson === lastRemoteJson || remoteJson === JSON.stringify(state)) return;
+
+  applyingRemoteState = true;
+  state = normalized;
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  lastRemoteJson = remoteJson;
+  applyingRemoteState = false;
+}
+
+function scheduleRemoteSave() {
+  if (applyingRemoteState || !firebaseDocRef) return;
+  ui.syncStatus = "saving";
+  window.clearTimeout(remoteSaveTimer);
+  remoteSaveTimer = window.setTimeout(async () => {
+    try {
+      await writeRemoteState();
+      ui.syncStatus = "online";
+      render();
+    } catch (error) {
+      console.warn("Impossible d'enregistrer dans Firestore.", error);
+      ui.syncStatus = "offline";
+      render();
+    }
+  }, 450);
+}
+
+async function writeRemoteState() {
+  if (!firebaseDocRef || !window.bbcalFirebaseSetDoc) return;
+  const payload = normalizeState(state);
+  lastRemoteJson = JSON.stringify(payload);
+  await window.bbcalFirebaseSetDoc(firebaseDocRef, {
+    state: payload,
+    updatedAt: window.bbcalFirebaseServerTimestamp ? window.bbcalFirebaseServerTimestamp() : new Date().toISOString()
+  }, { merge: true });
 }
 
 function render() {
@@ -417,6 +534,13 @@ function schoolName(school) {
   return school.name;
 }
 
+function syncStatusText() {
+  if (ui.syncStatus === "online") return t("firebaseOnline");
+  if (ui.syncStatus === "offline") return t("firebaseOffline");
+  if (ui.syncStatus === "saving") return t("firebaseSaving");
+  return t("firebaseConnecting");
+}
+
 function ensureSelections() {
   const allKeys = getAllClassKeys(state);
   const firstKey = allKeys[0] || "";
@@ -448,7 +572,7 @@ function renderCompareView() {
         <h1 class="view-title">${t("compareTitle")}</h1>
         <p class="view-lede">${t("compareLead")}</p>
       </div>
-      <span class="status-pill">${t("autosaved")}</span>
+      <span class="status-pill">${syncStatusText()}</span>
     </div>
 
     <div class="layout-grid">
@@ -641,7 +765,7 @@ function renderAvailabilityView() {
         <h1 class="view-title">${t("availabilityTitle")}</h1>
         <p class="view-lede">${t("availabilityLead")}</p>
       </div>
-      <span class="status-pill">${t("localSave")}</span>
+      <span class="status-pill">${syncStatusText()}</span>
     </div>
 
     <div class="layout-grid wide-left">
@@ -813,7 +937,7 @@ function renderSettingsView() {
         <h1 class="view-title">${t("settingsTitle")}</h1>
         <p class="view-lede">${t("settingsLead")}</p>
       </div>
-      <span class="status-pill">${t("browserData")}</span>
+      <span class="status-pill">${syncStatusText()}</span>
     </div>
 
     <div class="settings-grid">
